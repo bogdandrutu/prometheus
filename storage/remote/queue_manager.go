@@ -193,9 +193,11 @@ type QueueManager struct {
 	client         StorageClient
 	watcher        *WALWatcher
 
-	seriesLabels         map[uint64]labels.Labels
-	seriesSegmentIndexes map[uint64]int
-	droppedSeries        map[uint64]struct{}
+	seriesLabels            map[uint64]labels.Labels
+	seriesLabelsMtx         sync.Mutex
+	seriesSegmentIndexes    map[uint64]int
+	seriesSegmentIndexesMtx sync.Mutex
+	droppedSeries           map[uint64]struct{}
 
 	shards      *shards
 	numShards   int
@@ -263,7 +265,9 @@ func NewQueueManager(logger log.Logger, walDir string, samplesIn *ewmaRate, cfg 
 func (t *QueueManager) Append(samples []tsdb.RefSample) bool {
 outer:
 	for _, s := range samples {
+		t.seriesLabelsMtx.Lock()
 		lbls, ok := t.seriesLabels[s.Ref]
+		t.seriesLabelsMtx.Unlock()
 		if !ok {
 			t.droppedSamplesTotal.Inc()
 			t.samplesDropped.incr(1)
@@ -355,9 +359,11 @@ func (t *QueueManager) Stop() {
 	t.watcher.Stop()
 
 	// On shutdown, release the strings in the labels from the intern pool.
+	t.seriesLabelsMtx.Lock()
 	for _, labels := range t.seriesLabels {
 		releaseLabels(labels)
 	}
+	t.seriesLabelsMtx.Unlock()
 	// Delete metrics so we don't have alerts for queues that are gone.
 	name := t.client.Name()
 	queueHighestSentTimestamp.DeleteLabelValues(name)
@@ -384,16 +390,20 @@ func (t *QueueManager) StoreSeries(series []tsdb.RefSeries, index int) {
 			t.droppedSeries[s.Ref] = struct{}{}
 			continue
 		}
+		t.seriesSegmentIndexesMtx.Lock()
 		t.seriesSegmentIndexes[s.Ref] = index
+		t.seriesSegmentIndexesMtx.Unlock()
 		internLabels(lbls)
 
 		// We should not ever be replacing a series labels in the map, but just
 		// in case we do we need to ensure we do not leak the replaced interned
 		// strings.
+		t.seriesLabelsMtx.Lock()
 		if orig, ok := t.seriesLabels[s.Ref]; ok {
 			releaseLabels(orig)
 		}
 		t.seriesLabels[s.Ref] = lbls
+		t.seriesLabelsMtx.Unlock()
 	}
 }
 
@@ -401,6 +411,10 @@ func (t *QueueManager) StoreSeries(series []tsdb.RefSeries, index int) {
 // stored series records with the checkpoints index number, so we can now
 // delete any ref ID's lower than that # from the two maps.
 func (t *QueueManager) SeriesReset(index int) {
+	t.seriesSegmentIndexesMtx.Lock()
+	defer t.seriesSegmentIndexesMtx.Unlock()
+	t.seriesLabelsMtx.Lock()
+	defer t.seriesLabelsMtx.Unlock()
 	// Check for series that are in segments older than the checkpoint
 	// that were not also present in the checkpoint.
 	for k, v := range t.seriesSegmentIndexes {
